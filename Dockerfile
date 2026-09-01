@@ -11,7 +11,7 @@
 # 1.3.6.1.4.1.65230.3.2, which is the value a caller checks before
 # trusting this service with a credential.
 
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /src
 COPY go.mod go.sum ./
