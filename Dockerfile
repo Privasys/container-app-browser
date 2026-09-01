@@ -34,6 +34,9 @@ FROM alpine:3.21
 RUN apk add --no-cache \
         ca-certificates \
         chromium \
+        nss \
+        freetype \
+        harfbuzz \
         font-noto \
         font-noto-emoji \
         ttf-freefont \
@@ -44,7 +47,7 @@ RUN apk add --no-cache \
 COPY --from=builder /out/browser /usr/local/bin/browser
 COPY privasys.json /privasys.json
 
-ENV BROWSER_CHROMIUM=/usr/bin/chromium-browser
+ENV BROWSER_CHROMIUM=/usr/bin/chromium
 
 # No fixed port and no EXPOSE: the platform runs containers on the host
 # network and injects a unique $PORT per app.

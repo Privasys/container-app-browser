@@ -245,12 +245,18 @@ func (r *Renderer) Run(ctx context.Context, j Journey) Result {
 		chromedp.ExecPath(r.Chromium),
 		chromedp.WindowSize(width, height),
 		chromedp.UserAgent(agent),
+		// The sandbox is off because the container is the sandbox: an
+		// enclave of its own, no vault, no volume. Chromium refuses to
+		// run as root with it on, and the isolation that matters here is
+		// the one around the whole service.
 		chromedp.NoSandbox,
 		chromedp.Flag("headless", "new"),
-		// The renderer keeps nothing. A fresh profile per run means one
-		// journey cannot see another's cookies, and nothing survives the
-		// process.
-		chromedp.Flag("incognito", true),
+		// The renderer keeps nothing between calls: a fresh profile
+		// directory per allocator, discarded with the process. Incognito
+		// is deliberately not set on top of that, because it contradicts
+		// the profile directory chromedp supplies.
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("disable-software-rasterizer", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("disable-background-networking", true),
 		chromedp.Flag("disable-extensions", true),
@@ -259,6 +265,13 @@ func (r *Renderer) Run(ctx context.Context, j Journey) Result {
 		chromedp.Flag("no-default-browser-check", true),
 		chromedp.Flag("mute-audio", true),
 	)
+	// Chromium's own output is captured rather than discarded. When a
+	// browser fails to start it says why on standard error, and a
+	// renderer that swallows that leaves an operator with "the browser
+	// did not start" and nothing to act on.
+	var chatter safeBuffer
+	opts = append(opts, chromedp.CombinedOutput(&chatter))
+
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(runCtx, opts...)
 	defer cancelAlloc()
 	browserCtx, cancelBrowser := chromedp.NewContext(allocCtx)
@@ -294,7 +307,8 @@ func (r *Renderer) Run(ctx context.Context, j Journey) Result {
 	})
 
 	if err := chromedp.Run(browserCtx, network.Enable()); err != nil {
-		return Result{ErrorClass: ErrInternal, Error: "the browser did not start: " + err.Error()}
+		return Result{ErrorClass: ErrInternal,
+			Error: strings.TrimSpace("the browser did not start: " + err.Error() + " " + chatter.tail(400))}
 	}
 
 	for i := range j.Steps {
@@ -485,3 +499,29 @@ func hostOf(raw string) string {
 // needed; removing the import would change the vendored set.
 var _ = cdp.NodeID(0)
 var _ = page.Enable
+
+// safeBuffer collects the browser's own output. Chromium writes from
+// its own goroutines, so the collector has to be safe to write to while
+// the journey reads it.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// tail returns the last n characters, which is where a failure to start
+// says what was missing.
+func (b *safeBuffer) tail(n int) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := strings.TrimSpace(b.buf.String())
+	if len(s) <= n {
+		return s
+	}
+	return "..." + s[len(s)-n:]
+}
