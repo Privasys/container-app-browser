@@ -1,0 +1,65 @@
+{
+    "config_api": {
+        "method": "POST",
+        "path": "/configure"
+    },
+    "configure": {
+        "readiness_path": "/readiness"
+    },
+    "tools": [
+        {
+            "name": "configure",
+            "role": "config",
+            "description": "Bring the renderer up: the token its one caller will present, and optionally the domains a journey may navigate to. The runtime keeps every other endpoint at HTTP 503 until this succeeds. Nothing here is written to disk: this service has no volume, and holds the token in memory only.",
+            "endpoint": "/configure",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "caller_token": {
+                        "type": "string",
+                        "description": "The shared secret the calling monitor presents on every render. Attestation tells the caller which build it is talking to; this tells the renderer which caller is talking to it. At least 32 characters.",
+                        "x-privasys": { "secret": true, "label": "Caller token" }
+                    },
+                    "allowed_domains": {
+                        "type": "string",
+                        "description": "Comma-separated domains a journey may navigate to, subdomains included. Empty means any, which is appropriate when exactly one caller holds the token and keeps its own allowlist.",
+                        "x-privasys": { "label": "Allowed domains", "placeholder": "example.com, api.example.com" }
+                    }
+                },
+                "required": ["caller_token"]
+            }
+        },
+        {
+            "name": "render",
+            "role": "action",
+            "description": "Run a scripted journey in a headless browser and report what the page did: per-step outcomes, the document's rendered text, screenshots where the journey asked for them, console errors and failed subresource requests. It reaches no conclusion about availability; the caller decides what the result means, because the caller is the one that has to prove its arithmetic afterwards.",
+            "endpoint": "/render",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "description": "Ordered actions: goto, click, fill, press, wait, sleep, text, screenshot, eval.",
+                        "items": { "type": "object" }
+                    },
+                    "width": { "type": "integer", "description": "Viewport width. Default 1280." },
+                    "height": { "type": "integer", "description": "Viewport height. Default 800." },
+                    "timeout_ms": { "type": "integer", "description": "Budget for the whole journey. Default and maximum 120000." },
+                    "user_agent": { "type": "string", "description": "How to identify to the watched service." },
+                    "ocr": { "type": "boolean", "description": "Also recognise text in each screenshot. Worth it only for words a page draws rather than writes; the document's own text is better and free." }
+                },
+                "required": ["steps"]
+            }
+        }
+    ],
+    "store": {
+        "tagline": "A headless browser as an attested service: it renders a scripted journey and reports what the page did, holding nothing.",
+        "category": "Developer Tools",
+        "keywords": "headless browser, chromium, screenshots, synthetic monitoring, attestation, ra-tls, confidential computing, tdx",
+        "website_url": "https://privasys.org",
+        "support_email": "contact@privasys.org",
+        "privacy_url": "https://privasys.org/legal/privacy/",
+        "tos_url": "https://privasys.org/legal/terms/",
+        "description": "A headless browser that runs inside a confidential VM and renders a scripted journey for a caller that has verified its measurement.\n\nIT HOLDS NOTHING\nNo volume, no vault, no state between calls. Each journey runs in a fresh browser profile that does not survive the process, so one journey cannot see another's session, and a compromised page has nothing to find.\n\nIT DECIDES NOTHING\nThe renderer reports what happened: which step failed and why, the document's rendered text, screenshots where they were asked for, console errors, and the subresources that failed to load. It draws no conclusion about whether a service is up. That belongs to the caller, which has to be able to prove its arithmetic later.\n\nWHY IT IS SEPARATE\nA monitoring service that can be trusted with a real account should not also be parsing whatever a watched page returns. Splitting the browser into its own enclave, with its own measurement, keeps the page away from the credentials and the availability record."
+    }
+}

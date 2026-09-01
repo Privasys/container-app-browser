@@ -1,0 +1,256 @@
+# Copyright (c) 2026 Privasys.
+# Licensed under the GNU Affero General Public License v3.0.
+#
+# Test and smoke-test on every push and pull request; publish + release
+# ONLY on a `v*` git tag.
+#
+# Platform contract (management-service):
+#   - A deployable "version" == a TAG on the GHCR image.
+#   - Single-arch linux/amd64 with provenance/sbom off: an OCI
+#     attestation index would change the manifest digest the enclave
+#     pins at OID 1.3.6.1.4.1.65230.3.2, which is the value a caller
+#     checks before trusting this service with a credential.
+
+name: Build and Release container-app-browser
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/privasys/container-app-browser
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.24'
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change these files:"; echo "$unformatted"; exit 1
+          fi
+
+  # The smoke job renders a real page in the real image. A renderer that
+  # is only unit tested is a renderer nobody has watched render.
+  smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build the image
+        run: docker build -t browser-smoke .
+
+      - name: Serve a page to render
+        run: |
+          cd testdata && python3 -m http.server 18085 &
+          for _ in $(seq 1 20); do
+            curl -fs http://127.0.0.1:18085/page.html > /dev/null && break || sleep 1
+          done
+
+      - name: Render it, and refuse what should be refused
+        run: |
+          set -euo pipefail
+          PORT=18084
+          TOKEN=$(head -c 32 /dev/urandom | base64 | tr -d '=+/' | head -c 48)
+
+          docker run -d --name browser-smoke --network host \
+            -e PORT=$PORT browser-smoke
+
+          ok=0
+          for _ in $(seq 1 30); do
+            if curl -fs "http://127.0.0.1:$PORT/health" | grep -q '"status"'; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::The image did not serve /health on the injected PORT=$PORT."
+            docker logs browser-smoke || true; exit 1
+          fi
+
+          # Unconfigured, it renders nothing.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/render" \
+            -H 'Content-Type: application/json' -d '{"steps":[]}')
+          if [ "$code" != "503" ]; then
+            echo "::error::Before configuration /render answered $code, expected 503."; exit 1
+          fi
+
+          curl -fsS -X POST "http://127.0.0.1:$PORT/configure" \
+            -H 'Content-Type: application/json' \
+            -d "{\"caller_token\":\"$TOKEN\",\"allowed_domains\":\"127.0.0.1\"}" > /tmp/configured.json
+          if grep -q "$TOKEN" /tmp/configured.json; then
+            echo "::error::The caller token was echoed back."; exit 1
+          fi
+
+          # Without the token, nothing.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/render" \
+            -H 'Content-Type: application/json' -d '{"steps":[]}')
+          if [ "$code" != "401" ]; then
+            echo "::error::An unauthenticated render answered $code, expected 401."; exit 1
+          fi
+
+          echo "--- render a journey that clicks and reads the result ---"
+          curl -fsS -X POST "http://127.0.0.1:$PORT/render" \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"ocr":true,"steps":[
+                  {"name":"open","kind":"goto","url":"http://127.0.0.1:18085/page.html"},
+                  {"name":"wait for the button","kind":"wait","selector":"#place","wait_visible":true},
+                  {"name":"place an order","kind":"click","selector":"#place"},
+                  {"name":"read the page","kind":"text","screenshot":true}
+                ]}' > /tmp/render.json
+
+          if ! jq -e '.ok == true' /tmp/render.json > /dev/null; then
+            echo "::error::The journey did not complete."; jq -c '.' /tmp/render.json; exit 1
+          fi
+          # The page's own text: what most checks should assert on.
+          if ! jq -e '.steps[-1].text | test("Total: 42.00 GBP")' /tmp/render.json > /dev/null; then
+            echo "::error::The rendered text is not what the page shows."
+            jq -r '.steps[-1].text' /tmp/render.json; exit 1
+          fi
+          # A screenshot that decodes and is not a blank strip.
+          jq -r '.steps[-1].screenshot' /tmp/render.json | base64 -d > /tmp/shot.png
+          file /tmp/shot.png | grep -q 'PNG image data'
+          size=$(stat -c%s /tmp/shot.png)
+          if [ "$size" -lt 5000 ]; then
+            echo "::error::The screenshot is $size bytes, which is not a rendered page."; exit 1
+          fi
+          # Text drawn into a canvas, which the DOM cannot give you. This
+          # is the only thing recognition is here for.
+          if ! jq -e '.steps[-1].ocr_text | test("RECEIPT")' /tmp/render.json > /dev/null; then
+            echo "::error::Text drawn into the canvas was not recognised."
+            jq -r '.steps[-1].ocr_text' /tmp/render.json; exit 1
+          fi
+
+          echo "--- a selector that never appears fails readably ---"
+          curl -fsS -X POST "http://127.0.0.1:$PORT/render" \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"steps":[
+                  {"name":"open","kind":"goto","url":"http://127.0.0.1:18085/page.html"},
+                  {"name":"wait for something absent","kind":"wait","selector":"#nothing-here",
+                   "wait_visible":true,"timeout_ms":3000}
+                ]}' > /tmp/missing.json
+          if jq -e '.ok == true' /tmp/missing.json > /dev/null; then
+            echo "::error::A journey waiting for an absent element reported success."; exit 1
+          fi
+          if ! jq -e '.error | test("did not appear")' /tmp/missing.json > /dev/null; then
+            echo "::error::The failure does not say what went wrong."; jq -c '.' /tmp/missing.json; exit 1
+          fi
+
+          echo "--- the navigation policy is enforced ---"
+          curl -fsS -X POST "http://127.0.0.1:$PORT/render" \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"steps":[{"name":"go","kind":"goto","url":"https://example.com/"}]}' > /tmp/refused.json
+          if jq -e '.ok == true' /tmp/refused.json > /dev/null; then
+            echo "::error::A journey navigated outside the allowed domains."; exit 1
+          fi
+
+          echo "--- and it keeps nothing between calls ---"
+          # A second journey must not see the first one's page state.
+          curl -fsS -X POST "http://127.0.0.1:$PORT/render" \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"steps":[
+                  {"name":"open","kind":"goto","url":"http://127.0.0.1:18085/page.html"},
+                  {"name":"read the page","kind":"text"}
+                ]}' > /tmp/fresh.json
+          if jq -e '.steps[-1].text | test("Total: 42.00")' /tmp/fresh.json > /dev/null; then
+            echo "::error::A journey saw state left by an earlier one."; exit 1
+          fi
+
+          echo "--- container logs ---"; docker logs browser-smoke | tail -10
+          docker rm -f browser-smoke > /dev/null 2>&1 || true
+          echo "OK: renders a real page, reads it, photographs it, recognises what it drew,"
+          echo "    refuses an undeclared domain and an unauthenticated caller, and keeps nothing."
+
+  build:
+    needs: smoke
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Resolve tag
+        id: tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Read privasys.json
+        id: manifest
+        run: echo "json=$(jq -c . privasys.json | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          build-args: VERSION=${{ steps.tag.outputs.tag }}
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          labels: org.privasys.manifest=${{ steps.manifest.outputs.json }}
+
+      - name: Cut GitHub Release (Measurements)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          cat > notes.md <<EOF
+          ## Measurements
+
+          | Measurement | Value |
+          |-------------|-------|
+          | **Workload image digest** | \`${DIGEST}\` |
+          | **Attestation OID** | \`1.3.6.1.4.1.65230.3.2\` |
+          | **Pinned reference** | \`${IMAGE}@${DIGEST}\` |
+          | **Source commit** | \`${SHA}\` |
+
+          The workload image digest is the SHA-256 manifest digest of the published
+          container image. The enclave measures it into the RA-TLS leaf certificate
+          at OID **1.3.6.1.4.1.65230.3.2**.
+
+          This is the value a caller pins before sending a credential here. It covers
+          the browser and the text recogniser as well as this service, so a screenshot
+          and the words recognised in it are attributable to one exact build.
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --generate-notes --verify-tag
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "## ${{ steps.tag.outputs.tag }} published"
+            echo
+            echo '```'
+            echo "${IMAGE}@${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

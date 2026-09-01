@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Order service</title>
+<style>body{font-family:sans-serif;padding:40px}#total{font-size:28px}</style></head>
+<body>
+  <h1>Order service</h1>
+  <p id="status">ready</p>
+  <button id="place">Place order</button>
+  <p id="total"></p>
+  <!-- Text drawn into a canvas rather than written into the document:
+       the one case where recognising text from the screenshot beats
+       reading the DOM. -->
+  <canvas id="receipt" width="420" height="60"></canvas>
+  <script>
+    document.getElementById('place').addEventListener('click', () => {
+      document.getElementById('status').textContent = 'accepted';
+      document.getElementById('total').textContent = 'Total: 42.00 GBP';
+      const ctx = document.getElementById('receipt').getContext('2d');
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, 420, 60);
+      ctx.fillStyle = '#000000'; ctx.font = '28px sans-serif';
+      ctx.fillText('RECEIPT OK 42.00', 10, 40);
+    });
+  </script>
+</body>
+</html>
